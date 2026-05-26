@@ -136,7 +136,9 @@ void setLidarSpeed(int hz)
   if (hz > 8)
     hz = 8;
   currentScanHz = hz;
-  ledcWrite(LIDAR_PWM_CH, map(hz, 5, 8, 100, 255));
+  // 参照驱动说明：M_SCTR 使用 10kHz PWM，且占空比越小转速越快。
+  // 这里把 5Hz 作为较慢档，对应接近 100% 占空比；8Hz 作为较快档，对应接近 50% 占空比。
+  ledcWrite(LIDAR_PWM_CH, map(hz, 5, 8, 255, 128));
 }
 
 void startLidar()
@@ -303,7 +305,7 @@ void setup()
   // 3. 初始化雷达引脚及串口
   LidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX, -1);
   pinMode(LIDAR_MCTR, OUTPUT);
-  ledcSetup(LIDAR_PWM_CH, 1000, 8);
+  ledcSetup(LIDAR_PWM_CH, PWM_FREQ, PWM_RES);
   ledcAttachPin(LIDAR_MCTR, LIDAR_PWM_CH);
 
   // 4. 启动 UDP 透传
