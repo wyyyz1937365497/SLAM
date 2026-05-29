@@ -5,272 +5,418 @@
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/imu.h>
-#include <nav_msgs/msg/odometry.h> // 新增里程计消息
+#include <nav_msgs/msg/odometry.h>
 #include <WiFi.h>
 #include <HardwareSerial.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <rosidl_runtime_c/string_functions.h>
 #include <sys/time.h>
-#include <math.h>
+#include <driver/gpio.h>
 
-// ================= 硬件引脚定义 =================
+/*
+ros2 run tf2_ros static_transform_publisher -0.06743 -0.03446 0.041 0 0 0 1 base_link imu_link
+ros2 run micro_ros_agent micro_ros_agent udp4 --port 8888
+socat PTY,link=/tmp/lidar0,raw,echo=0 UDP-LISTEN:9999,reuseaddr,fork
+ros2 launch ydlidar_ros2_driver ydlidar_launch.py params_file:=ydlidar_ros2_driver/params/X2.yaml
+ros2 launch ./slam_car_cartographer/launch/slam_cartographer.launch.py
+rviz2
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r /cmd_vel:=/cmd_vel
+*/
+
+// ============ 硬件引脚配置 ============
 const int M_PWM[4] = {21, 20, 19, 18};
 const int M_IN1[4] = {14, 16, 4, 13};
 const int M_IN2[4] = {15, 17, 5, 12};
-const int STBY_A = 41, STBY_B = 42;
+const int STBY_A = 41;
+const int STBY_B = 42;
+
+const int I2C_SDA_FL = 45; // FL 编码器 & MPU6050 -> Wire1
+const int I2C_SCL_FL = 46;
+const int I2C_SDA_FR = 1; // FR 编码器 -> Wire
+const int I2C_SCL_FR = 2;
 #define LIDAR_RX 9
 #define LIDAR_MCTR 10
-#define IMU_SDA 6
-#define IMU_SCL 7
-const int ENC_SDA[4] = {45, 8, 11, 1}; // FL, FR, RL, RR
-const int ENC_SCL[4] = {46, 3, 0, 2};
-TwoWire I2C_ENC[4] = {TwoWire(0), TwoWire(1), TwoWire(0), TwoWire(1)};
+const int PWM_FREQ = 10000;
+const int PWM_RES = 8;
+const int LIDAR_PWM_CH = 4;
 
-// ================= 系统参数 (已更新) =================
-#define WHEEL_RADIUS 0.0325f // 65mm/2 = 0.0325m
-#define BASE_WIDTH 0.126f    // 左右轮着地点间距 126mm
-#define MIN_PWM 85
+// ============ 运动学参数 ============
+#define WHEEL_RADIUS 0.030f
+#define TRACKWIDTH 0.126f
+#define MIN_PWM 130
 #define MAX_PWM 255
-#define MAX_LINEAR_VEL 0.5f
-#define MAX_ANGULAR_VEL 1.0f
+#define MAX_LINEAR_VEL 3.0f
+#define MAX_ANGULAR_VEL 90.0f
+
+// ============ 传感器配置 ============
+#define MT6701_I2C_ADDR 0x06
+#define REG_ANGLE_MSB 0x03
+#define MAX_ANGLE_VALUE 16384.0f
+#define ENC_FL 0
+#define ENC_RR 1 // 逻辑右轮（现为后右 RR）
+#define ENC_COUNT 2
+
+// 编码器方向校正系数（正负号决定该侧速度方向）
+// 若前进时建图左转，说明左右符号相反，将一侧取反即可对齐
+#define ENC_FL_DIR -1.0f
+#define ENC_RR_DIR 1.0f // 默认 -1.0f 修正后轮安装方向相反问题
+// ============ 对象与变量 ============
+Adafruit_MPU6050 mpu;
 char WIFI_SSID[] = "buyaotaoshui";
 char WIFI_PASS[] = "buyaotaoshui";
 char AGENT_IP[] = "192.168.123.86";
 
-// ROS 句柄
 rcl_subscription_t subscriber;
 geometry_msgs__msg__Twist twist_msg;
-rcl_publisher_t imu_publisher, odom_publisher;
+rcl_publisher_t imu_publisher;
 sensor_msgs__msg__Imu imu_msg;
+rcl_publisher_t odom_publisher;
 nav_msgs__msg__Odometry odom_msg;
 rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 
-// 外设句柄
 HardwareSerial LidarSerial(1);
 const IPAddress PC_IP(192, 168, 123, 86);
 const uint16_t UDP_PORT = 9999;
 #define MAX_PACKET_SIZE 128
 uint8_t frameBuf[MAX_PACKET_SIZE];
-uint16_t frameIdx = 0, expectedLen = 0;
+uint16_t frameIdx = 0;
+uint16_t expectedLen = 0;
 WiFiUDP udp;
 int currentScanHz = 6;
 
-// 状态变量
-float odom_x = 0, odom_y = 0, odom_theta = 0;
-float last_enc_angle[4] = {0, 0, 0, 0};
-bool enc_ready[4] = {false, false, false, false};
-float gyro_yaw = 0; // MPU6050 无磁力计，改用陀螺仪积分航向
+float odom_x = 0.0, odom_y = 0.0, odom_theta = 0.0;
+uint32_t last_enc_time = 0;
+bool odom_initialized = false;
 
-// ================= MPU6050 轻量驱动 =================
-#define MPU6050_ADDR 0x68
-float acc_x = 0, acc_y = 0, acc_z = 0;
-float gyro_x = 0, gyro_y = 0, gyro_z = 0;
-
-void i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t val)
+// ============ 电机控制 ============
+void setWheelSigned(int index, float speedRatio)
 {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
-}
-void i2cReadReg(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len)
-{
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  Wire.endTransmission(false);
-  Wire.requestFrom(addr, len);
-  for (int i = 0; i < len; i++)
-    if (Wire.available())
-      buf[i] = Wire.read();
-}
-
-void initMPU6050()
-{
-  Wire.begin(IMU_SDA, IMU_SCL, 400000);
-  i2cWriteReg(MPU6050_ADDR, 0x6B, 0x00); // 唤醒
-  i2cWriteReg(MPU6050_ADDR, 0x1A, 0x03); // DLPF 42Hz
-  i2cWriteReg(MPU6050_ADDR, 0x1B, 0x00); // 陀螺仪 ±250 dps
-  i2cWriteReg(MPU6050_ADDR, 0x1C, 0x00); // 加速度计 ±2g
-}
-
-void readMPU6050()
-{
-  uint8_t buf[14];
-  i2cReadReg(MPU6050_ADDR, 0x3B, buf, 14);
-  acc_x = (int16_t)(buf[0] << 8 | buf[1]) / 16384.0 * 9.81;
-  acc_y = (int16_t)(buf[2] << 8 | buf[3]) / 16384.0 * 9.81;
-  acc_z = (int16_t)(buf[4] << 8 | buf[5]) / 16384.0 * 9.81;
-  gyro_x = (int16_t)(buf[8] << 8 | buf[9]) / 131.0 * (PI / 180.0);
-  gyro_y = (int16_t)(buf[10] << 8 | buf[11]) / 131.0 * (PI / 180.0);
-  gyro_z = (int16_t)(buf[12] << 8 | buf[13]) / 131.0 * (PI / 180.0);
-}
-
-void getOrientationQuaternion(float &qw, float &qx, float &qy, float &qz)
-{
-  float roll = atan2(acc_y, acc_z);
-  float pitch = atan2(-acc_x, sqrt(acc_y * acc_y + acc_z * acc_z));
-  gyro_yaw += gyro_z * 0.05f; // 20Hz 积分
-  float yaw = gyro_yaw;
-
-  float cy = cos(yaw * 0.5), sy = sin(yaw * 0.5);
-  float cp = cos(pitch * 0.5), sp = sin(pitch * 0.5);
-  float cr = cos(roll * 0.5), sr = sin(roll * 0.5);
-  qw = cr * cp * cy + sr * sp * sy;
-  qx = sr * cp * cy - cr * sp * sy;
-  qy = cr * sp * cy + sr * cp * sy;
-  qz = cr * cp * sy - sr * sp * cy;
-}
-
-// ================= MT6701 I2C 读取 =================
-float readMT6701(TwoWire &wire)
-{
-  wire.beginTransmission(0x06);
-  wire.write(0x03);
-  if (wire.endTransmission(false) != 0)
-    return -1.0;
-  uint8_t n = wire.requestFrom(0x06, (uint8_t)2);
-  if (n != 2)
-    return -1.0;
-  uint8_t msb = wire.read(), lsb = wire.read();
-  return (((msb << 6) | (lsb & 0x3F)) / 16384.0) * 360.0;
-}
-
-// ================= 电机控制 =================
-void setWheelSigned(int idx, float ratio)
-{
-  if (idx < 0 || idx > 3)
+  if (index < 0 || index > 3)
     return;
-  float absR = fabs(ratio);
-  if (absR < 0.01f)
+  float absSpeed = fabs(speedRatio);
+  if (absSpeed < 0.01f)
   {
-    digitalWrite(M_IN1[idx], LOW);
-    digitalWrite(M_IN2[idx], LOW);
-    ledcWrite(idx, 0);
+    digitalWrite(M_IN1[index], LOW);
+    digitalWrite(M_IN2[index], LOW);
+    ledcWrite(index, 0);
     return;
   }
-  int duty = constrain((int)(MIN_PWM + (MAX_PWM - MIN_PWM) * absR), MIN_PWM, MAX_PWM);
-  if (ratio > 0)
+  int duty = (int)(MIN_PWM + (MAX_PWM - MIN_PWM) * absSpeed);
+  duty = constrain(duty, MIN_PWM, MAX_PWM);
+  if (speedRatio > 0)
   {
-    digitalWrite(M_IN1[idx], HIGH);
-    digitalWrite(M_IN2[idx], LOW);
+    digitalWrite(M_IN1[index], HIGH);
+    digitalWrite(M_IN2[index], LOW);
   }
   else
   {
-    digitalWrite(M_IN1[idx], LOW);
-    digitalWrite(M_IN2[idx], HIGH);
+    digitalWrite(M_IN1[index], LOW);
+    digitalWrite(M_IN2[index], HIGH);
   }
-  ledcWrite(idx, duty);
+  ledcWrite(index, duty);
 }
 
-void driveNormal4WD(float vx, float vy, float omega)
+void driveDifferential(float vx, float vy, float omega)
 {
-  vy = 0;
   vx = constrain(vx, -MAX_LINEAR_VEL, MAX_LINEAR_VEL);
   omega = constrain(omega, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL);
-  float w_left = vx - (BASE_WIDTH / 2.0f) * omega;
-  float w_right = vx + (BASE_WIDTH / 2.0f) * omega;
-  float max_w = fmax(fabs(w_left), fabs(w_right));
-  if (max_w < 0.001f)
+  float v_left = vx - omega * (TRACKWIDTH / 2.0f);
+  float v_right = vx + omega * (TRACKWIDTH / 2.0f);
+  float max_val = fmaxf(fabsf(v_left), fabsf(v_right));
+  if (max_val > MAX_LINEAR_VEL)
   {
-    for (int i = 0; i < 4; i++)
-      setWheelSigned(i, 0);
-    return;
+    float scale = MAX_LINEAR_VEL / max_val;
+    v_left *= scale;
+    v_right *= scale;
   }
-  float scale = (max_w > MAX_LINEAR_VEL) ? MAX_LINEAR_VEL / max_w : 1.0f;
-  w_left *= scale;
-  w_right *= scale;
-  setWheelSigned(0, w_left);
-  setWheelSigned(2, w_left);
-  setWheelSigned(1, w_right);
-  setWheelSigned(3, w_right);
+  setWheelSigned(0, v_left / MAX_LINEAR_VEL);
+  setWheelSigned(1, v_left / MAX_LINEAR_VEL);
+  setWheelSigned(2, v_right / MAX_LINEAR_VEL);
+  setWheelSigned(3, v_right / MAX_LINEAR_VEL);
 }
 
-// ================= ROS 回调 =================
 void subscription_callback(const void *msgin)
 {
   const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
-  driveNormal4WD(msg->linear.x, msg->linear.y, msg->angular.z);
+  driveDifferential(msg->linear.x, msg->linear.y, msg->angular.z);
 }
 
-// ================= 雷达任务 (Core 0) =================
+// ============ 编码器读取 ============
+float readMT6701Angle(int encoder_idx)
+{
+  uint8_t msb, lsb;
+  int bytesRead = 0;
+  if (encoder_idx == ENC_FL)
+  {
+    Wire1.beginTransmission(MT6701_I2C_ADDR);
+    Wire1.write(REG_ANGLE_MSB);
+    Wire1.endTransmission(false);
+    Wire1.requestFrom(MT6701_I2C_ADDR, (uint8_t)2);
+    if (Wire1.available() == 2)
+    {
+      msb = Wire1.read();
+      lsb = Wire1.read();
+      bytesRead = 2;
+    }
+  }
+  else if (encoder_idx == ENC_RR) // 👈 改为 ENC_RR
+  {
+    Wire.beginTransmission(MT6701_I2C_ADDR);
+    Wire.write(REG_ANGLE_MSB);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MT6701_I2C_ADDR, (uint8_t)2);
+    if (Wire.available() == 2)
+    {
+      msb = Wire.read();
+      lsb = Wire.read();
+      bytesRead = 2;
+    } // 注意原代码此处有笔误，应为 Wire.read()，已顺带修正
+  }
+  else
+  {
+    return -1.0f;
+  }
+  if (bytesRead != 2)
+    return -1.0f;
+  uint16_t rawAngle = (msb << 6) | (lsb & 0x3F);
+  return (rawAngle / MAX_ANGLE_VALUE) * 360.0f;
+}
+
+float getEncoderSpeed(int enc_idx, float current_angle, uint32_t current_time)
+{
+  static float last_angle[ENC_COUNT] = {0};
+  static uint32_t last_time[ENC_COUNT] = {0};
+  if (!odom_initialized)
+  {
+    last_angle[enc_idx] = current_angle;
+    last_time[enc_idx] = current_time;
+    return 0;
+  }
+  uint32_t dt = current_time - last_time[enc_idx];
+  if (dt < 5)
+    return 0;
+  float d_angle = current_angle - last_angle[enc_idx];
+  if (d_angle > 180.0f)
+    d_angle -= 360.0f;
+  if (d_angle < -180.0f)
+    d_angle += 360.0f;
+  float dt_sec = dt / 1000.0f;
+  float angular_vel = d_angle * M_PI / 180.0f / dt_sec;
+  float linear_vel = WHEEL_RADIUS * angular_vel;
+  last_angle[enc_idx] = current_angle;
+  last_time[enc_idx] = current_time;
+  return linear_vel;
+}
+
+void initEncoders()
+{
+  Serial.println("🔧 初始化双硬件I2C编码器...");
+  // Wire1.begin(I2C_SDA_FL, I2C_SCL_FL);
+  Serial.printf("✅ FL (Wire1): SDA=%d, SCL=%d\n", I2C_SDA_FL, I2C_SCL_FL);
+  Wire.begin(I2C_SDA_FR, I2C_SCL_FR);
+  Serial.printf("✅ FR (Wire):  SDA=%d, SCL=%d\n", I2C_SDA_FR, I2C_SCL_FR);
+  delay(50);
+  for (int i = 0; i < ENC_COUNT; i++)
+  {
+    float angle = readMT6701Angle(i);
+    if (angle >= 0)
+      Serial.printf("  ✅ 编码器%d 角度: %.2f°\n", i, angle);
+    else
+      Serial.printf("  ❌ 编码器%d 读取失败\n", i);
+  }
+}
+
+// ============ 里程计更新与发布 ============
+void updateOdometry()
+{
+  uint32_t now = millis();
+  if (!odom_initialized)
+  {
+    last_enc_time = now;
+    odom_initialized = true;
+    return;
+  }
+  uint32_t dt_ms = now - last_enc_time;
+  if (dt_ms < 20)
+    return;
+  float dt = dt_ms / 1000.0f;
+
+  float wheel_speed[ENC_COUNT] = {0};
+  bool valid[ENC_COUNT] = {false, false};
+  for (int i = 0; i < ENC_COUNT; i++)
+  {
+    float angle = readMT6701Angle(i);
+    if (angle >= 0)
+    {
+      valid[i] = true;
+      wheel_speed[i] = getEncoderSpeed(i, angle, now);
+    }
+  }
+  // 应用方向校正系数，确保左右轮前进时速度符号一致
+  float v_left = valid[ENC_FL] ? wheel_speed[ENC_FL] * ENC_FL_DIR : 0.0f;
+  float v_right = valid[ENC_RR] ? wheel_speed[ENC_RR] * ENC_RR_DIR : 0.0f;
+  float v_body = (v_left + v_right) / 2.0f;
+  float w_encoder = (v_right - v_left) / TRACKWIDTH;
+
+  odom_theta += w_encoder * dt;
+  while (odom_theta > M_PI)
+    odom_theta -= 2 * M_PI;
+  while (odom_theta < -M_PI)
+    odom_theta += 2 * M_PI;
+  odom_x += v_body * cosf(odom_theta) * dt;
+  odom_y += v_body * sinf(odom_theta) * dt;
+
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  odom_msg.header.stamp.sec = tv.tv_sec;
+  odom_msg.header.stamp.nanosec = tv.tv_usec * 1000;
+  rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
+  rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+  odom_msg.pose.pose.position.x = odom_x;
+  odom_msg.pose.pose.position.y = odom_y;
+  odom_msg.pose.pose.position.z = 0;
+  odom_msg.pose.pose.orientation.x = 0.0;
+  odom_msg.pose.pose.orientation.y = 0.0;
+  odom_msg.pose.pose.orientation.z = sin(odom_theta / 2.0);
+  odom_msg.pose.pose.orientation.w = cos(odom_theta / 2.0);
+  odom_msg.pose.covariance[0] = 0.01;
+  odom_msg.pose.covariance[7] = 0.04;
+  odom_msg.pose.covariance[35] = 0.03;
+  odom_msg.twist.covariance[0] = 0.01;
+  odom_msg.twist.covariance[35] = 0.03;
+  odom_msg.twist.twist.linear.x = v_body;
+  odom_msg.twist.twist.angular.z = w_encoder;
+  (void)rcl_publish(&odom_publisher, &odom_msg, NULL);
+  last_enc_time = now;
+}
+
+// ============ IMU 发布 ============
+void publishImu()
+{
+  sensors_event_t a, g, temp;
+  if (!mpu.getEvent(&a, &g, &temp))
+    return; // 读取失败保护
+
+  // 坐标系映射: Sensor(X↑, Y后, Z右) -> ROS(X前, Y左, Z上)
+  // Adafruit库已输出 SI 单位 (m/s², rad/s)，无需手动除LSB
+  float a_x = -a.acceleration.y;
+  float a_y = -a.acceleration.z;
+  float a_z = -a.acceleration.x; // 重力向下 => ax≈-9.81 => -(-9.81)=+9.81 (ROS Z向上)
+
+  float g_x = -g.gyro.y;
+  float g_y = -g.gyro.z;
+  float g_z = g.gyro.x;
+
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  imu_msg.header.stamp.sec = tv.tv_sec;
+  imu_msg.header.stamp.nanosec = tv.tv_usec * 1000;
+  rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
+  imu_msg.linear_acceleration.x = a_x;
+  imu_msg.linear_acceleration.y = a_y;
+  imu_msg.linear_acceleration.z = a_z;
+  imu_msg.angular_velocity.x = g_x;
+  imu_msg.angular_velocity.y = g_y;
+  imu_msg.angular_velocity.z = g_z;
+  imu_msg.orientation_covariance[0] = -1.0;
+  (void)rcl_publish(&imu_publisher, &imu_msg, NULL);
+}
+
+// ============ 雷达部分 ============
+void setLidarSpeed(int hz)
+{
+  hz = constrain(hz, 5, 8);
+  currentScanHz = hz;
+  ledcWrite(LIDAR_PWM_CH, map(hz, 5, 8, 255, 128));
+}
+void startLidar()
+{
+  setLidarSpeed(currentScanHz);
+  delay(100);
+  LidarSerial.write(0xA5);
+  LidarSerial.write(0x60);
+  while (LidarSerial.available())
+    LidarSerial.read();
+  frameIdx = 0;
+  expectedLen = 0;
+}
+void processLidarByte(uint8_t b)
+{
+  if (frameIdx >= MAX_PACKET_SIZE)
+  {
+    frameIdx = 0;
+    expectedLen = 0;
+    return;
+  }
+  if (frameIdx == 0)
+  {
+    if (b == 0xAA)
+      frameBuf[frameIdx++] = b;
+    return;
+  }
+  if (frameIdx == 1)
+  {
+    if (b == 0x55)
+      frameBuf[frameIdx++] = b;
+    else
+      frameIdx = 0;
+    return;
+  }
+  if (frameIdx == 2)
+  {
+    frameBuf[frameIdx++] = b;
+    return;
+  }
+  if (frameIdx == 3)
+  {
+    frameBuf[frameIdx++] = b;
+    expectedLen = 10 + b * 2;
+    if (expectedLen > MAX_PACKET_SIZE)
+    {
+      frameIdx = 0;
+      expectedLen = 0;
+    }
+    return;
+  }
+  frameBuf[frameIdx++] = b;
+  if (frameIdx >= expectedLen)
+  {
+    udp.beginPacket(PC_IP, UDP_PORT);
+    udp.write(frameBuf, frameIdx);
+    udp.endPacket();
+    frameIdx = 0;
+    expectedLen = 0;
+  }
+}
 void lidarTask(void *pvParameters)
 {
+  Serial.println("✅ [Core 0] 雷达任务已启动");
   for (;;)
   {
     while (LidarSerial.available())
-    {
-      uint8_t b = LidarSerial.read();
-      if (frameIdx >= MAX_PACKET_SIZE)
-      {
-        frameIdx = 0;
-        expectedLen = 0;
-      }
-      if (frameIdx == 0)
-      {
-        if (b == 0xAA)
-          frameBuf[frameIdx++];
-        continue;
-      }
-      if (frameIdx == 1)
-      {
-        if (b == 0x55)
-          frameBuf[frameIdx++];
-        else
-          frameIdx = 0;
-        continue;
-      }
-      if (frameIdx == 2)
-      {
-        frameBuf[frameIdx++];
-        continue;
-      }
-      if (frameIdx == 3)
-      {
-        frameBuf[frameIdx++] = b;
-        expectedLen = 10 + b * 2;
-        if (expectedLen > MAX_PACKET_SIZE)
-        {
-          frameIdx = 0;
-          expectedLen = 0;
-        }
-        continue;
-      }
-      frameBuf[frameIdx++] = b;
-      if (frameIdx >= expectedLen)
-      {
-        udp.beginPacket(PC_IP, UDP_PORT);
-        udp.write(frameBuf, frameIdx);
-        udp.endPacket();
-        frameIdx = 0;
-        expectedLen = 0;
-      }
-    }
+      processLidarByte(LidarSerial.read());
     vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 }
-void setLidarSpeed(int hz)
-{
-  currentScanHz = constrain(hz, 5, 8);
-  ledcWrite(4, map(currentScanHz, 5, 8, 255, 128));
-}
 
-// ================= Setup =================
+// ============ Setup ============
 void setup()
 {
   Serial.begin(115200);
   delay(500);
-  // 1. 电机
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < 4; ++i)
   {
     pinMode(M_IN1[i], OUTPUT);
     pinMode(M_IN2[i], OUTPUT);
     digitalWrite(M_IN1[i], LOW);
     digitalWrite(M_IN2[i], LOW);
-    ledcSetup(i, 10000, 8);
+    ledcSetup(i, PWM_FREQ, PWM_RES);
     ledcAttachPin(M_PWM[i], i);
     ledcWrite(i, 0);
   }
@@ -279,62 +425,65 @@ void setup()
   digitalWrite(STBY_A, HIGH);
   digitalWrite(STBY_B, HIGH);
 
-  // 2. WiFi & NTP
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("📡 连接WiFi...");
+  Serial.print("📡 连接 WiFi...");
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\n✅ IP: " + WiFi.localIP().toString());
-  configTime(0, 0, "ntp.aliyun.com", "pool.ntp.org");
+  Serial.println("\n✅ WiFi 连接成功, IP: " + WiFi.localIP().toString());
 
-  // 3. 雷达
+  configTime(0, 0, "ntp.aliyun.com", "pool.ntp.org");
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo))
+    Serial.println("✅ NTP 时间同步成功");
+
   LidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX, -1);
   pinMode(LIDAR_MCTR, OUTPUT);
-  ledcSetup(4, 10000, 8);
-  ledcAttachPin(LIDAR_MCTR, 4);
+  ledcSetup(LIDAR_PWM_CH, PWM_FREQ, PWM_RES);
+  ledcAttachPin(LIDAR_MCTR, LIDAR_PWM_CH);
   udp.begin(UDP_PORT);
-  setLidarSpeed(currentScanHz);
+  startLidar();
   xTaskCreatePinnedToCore(lidarTask, "LidarTask", 4096, NULL, 2, NULL, 0);
 
-  // 4. MPU6050
-  initMPU6050();
-  Serial.println("✅ MPU6050 就绪");
-
-  // 5. 编码器探测 (兼容右后损坏)
-  for (int i = 0; i < 4; i++)
+  // ✅ 初始化 I2C 与 MPU6050 (标准库)
+  Wire1.begin(I2C_SDA_FL, I2C_SCL_FL);
+  Serial.println("初始化 MPU6050 (硬件I2C-1 @ 45/46)...");
+  if (!mpu.begin(0x68, &Wire1))
   {
-    I2C_ENC[i].begin(ENC_SDA[i], ENC_SCL[i], 50000);
-    I2C_ENC[i].beginTransmission(0x06);
-    enc_ready[i] = (I2C_ENC[i].endTransmission() == 0);
-    Serial.printf("📐 编码器 %d %s\n", i, enc_ready[i] ? "在线" : "离线");
+    Serial.println("❌ MPU6050 初始化失败");
   }
+  else
+  {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("✅ MPU6050 识别成功");
+  }
+  initEncoders();
 
-  // 6. micro-ROS
+  Serial.println("🔄 正在初始化 micro-ROS...");
   IPAddress agent_ip;
   agent_ip.fromString(AGENT_IP);
   set_microros_wifi_transports(WIFI_SSID, WIFI_PASS, agent_ip, 8888);
   allocator = rcl_get_default_allocator();
-  rclc_support_init(&support, 0, NULL, &allocator);
+  int retry_count = 0;
+  while (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK && retry_count < 10)
+  {
+    delay(1000);
+    retry_count++;
+  }
   rclc_node_init_default(&node, "esp32_slam_car", "", &support);
-
   rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "/cmd_vel");
   rclc_publisher_init_default(&imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "/imu/data");
   rclc_publisher_init_default(&odom_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "/odom");
-
-  rclc_executor_init(&executor, &support.context, 2, &allocator);
+  rclc_executor_init(&executor, &support.context, 1, &allocator);
   rclc_executor_add_subscription(&executor, &subscriber, &twist_msg, &subscription_callback, ON_NEW_DATA);
-
-  rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "base_link");
-  rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
-  rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
-  Serial.println("🚀 系统启动：MPU6050 + 3路编码器里程计 + 激光透传");
+  Serial.println("🚀 SLAM 小车系统就绪 (Adafruit MPU6050 + HW I2C Enc)！");
 }
 
-// ================= Loop =================
 void loop()
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -343,130 +492,17 @@ void loop()
     delay(1000);
     return;
   }
-  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
-
-  static unsigned long last_imu = 0, last_odom = 0;
-  unsigned long now = millis();
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  rcl_time_point_value_t stamp_sec = tv.tv_sec;
-  rcl_time_point_value_t stamp_nsec = tv.tv_usec * 1000;
-
-  // 20Hz IMU & 里程计 同步发布
-  if (now - last_imu >= 50)
+  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+  static unsigned long last_imu_time = 0;
+  if (millis() - last_imu_time >= 20)
   {
-    last_imu = now;
-    readMPU6050();
-
-    // 发布 IMU
-    imu_msg.header.stamp.sec = stamp_sec;
-    imu_msg.header.stamp.nanosec = stamp_nsec;
-    float qw, qx, qy, qz;
-    getOrientationQuaternion(qw, qx, qy, qz);
-    imu_msg.orientation.w = qw;
-    imu_msg.orientation.x = qx;
-    imu_msg.orientation.y = qy;
-    imu_msg.orientation.z = qz;
-    imu_msg.angular_velocity.x = gyro_x;
-    imu_msg.angular_velocity.y = gyro_y;
-    imu_msg.angular_velocity.z = gyro_z;
-    imu_msg.linear_acceleration.x = acc_x;
-    imu_msg.linear_acceleration.y = acc_y;
-    imu_msg.linear_acceleration.z = acc_z;
-    imu_msg.orientation_covariance[0] = 1e-2;
-    imu_msg.orientation_covariance[4] = 1e-2;
-    imu_msg.orientation_covariance[8] = 0.1;
-    imu_msg.angular_velocity_covariance[0] = 1e-4;
-    imu_msg.angular_velocity_covariance[4] = 1e-4;
-    imu_msg.angular_velocity_covariance[8] = 1e-4;
-    imu_msg.linear_acceleration_covariance[0] = 1e-3;
-    imu_msg.linear_acceleration_covariance[4] = 1e-3;
-    imu_msg.linear_acceleration_covariance[8] = 1e-3;
-    rcl_publish(&imu_publisher, &imu_msg, NULL);
-
-    // 发布 Odom
-    float cur_angle[4];
-    for (int i = 0; i < 4; i++)
-    {
-      cur_angle[i] = enc_ready[i] ? readMT6701(I2C_ENC[i]) : last_enc_angle[i];
-      if (cur_angle[i] < 0)
-        cur_angle[i] = last_enc_angle[i];
-    }
-
-    float dL = 0, dR = 0;
-    int cntL = 0, cntR = 0;
-    // 左侧平均 (FL=0, RL=2)
-    for (int i = 0; i < 4; i += 2)
-    {
-      if (enc_ready[i])
-      {
-        float d = cur_angle[i] - last_enc_angle[i];
-        if (d > 180)
-          d -= 360;
-        if (d < -180)
-          d += 360;
-        dL += d;
-        cntL++;
-        last_enc_angle[i] = cur_angle[i];
-      }
-    }
-    // 右侧平均 (FR=1, RR=3) -> RR损坏自动跳过
-    for (int i = 1; i < 4; i += 2)
-    {
-      if (enc_ready[i])
-      {
-        float d = cur_angle[i] - last_enc_angle[i];
-        if (d > 180)
-          d -= 360;
-        if (d < -180)
-          d += 360;
-        dR += d;
-        cntR++;
-        last_enc_angle[i] = cur_angle[i];
-      }
-    }
-    if (cntL > 0)
-      dL /= cntL;
-    if (cntR > 0)
-      dR /= cntR;
-
-    float circ = 2 * PI * WHEEL_RADIUS;
-    float ds_L = dL / 360.0 * circ;
-    float ds_R = dR / 360.0 * circ;
-    float ds = (ds_L + ds_R) / 2.0;
-    float dtheta = (ds_R - ds_L) / BASE_WIDTH;
-
-    odom_x += ds * cos(odom_theta);
-    odom_y += ds * sin(odom_theta);
-    odom_theta += dtheta;
-    while (odom_theta > PI)
-      odom_theta -= 2 * PI;
-    while (odom_theta < -PI)
-      odom_theta += 2 * PI;
-
-    odom_msg.header.stamp.sec = stamp_sec;
-    odom_msg.header.stamp.nanosec = stamp_nsec;
-    odom_msg.pose.pose.position.x = odom_x;
-    odom_msg.pose.pose.position.y = odom_y;
-    odom_msg.pose.pose.position.z = 0.0;
-    odom_msg.pose.pose.orientation.w = qw;
-    odom_msg.pose.pose.orientation.x = qx;
-    odom_msg.pose.pose.orientation.y = qy;
-    odom_msg.pose.pose.orientation.z = qz;
-    odom_msg.twist.twist.linear.x = ds / 0.05f;
-    odom_msg.twist.twist.angular.z = dtheta / 0.05f;
-
-    // 2D 里程计协方差 (对角线赋值)
-    for (int i = 0; i < 36; i++)
-    {
-      odom_msg.pose.covariance[i] = 0;
-      odom_msg.twist.covariance[i] = 0;
-    }
-    odom_msg.pose.covariance[0] = 1e-3;
-    odom_msg.pose.covariance[7] = 1e-3;
-    odom_msg.pose.covariance[35] = 1e-3;
-    odom_msg.twist.covariance[0] = 1e-3;
-    odom_msg.twist.covariance[35] = 1e-3;
-    rcl_publish(&odom_publisher, &odom_msg, NULL);
+    last_imu_time = millis();
+    publishImu();
+  }
+  static unsigned long last_odom_time = 0;
+  if (millis() - last_odom_time >= 20)
+  {
+    last_odom_time = millis();
+    updateOdometry();
   }
 }
