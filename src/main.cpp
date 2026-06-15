@@ -1,7 +1,7 @@
 /**
 @file main.cpp
 @brief ESP32-S3 阿克曼底盘 SLAM 小车 (后轮驱动 + 前轮转向 + 独立双PID闭环电机控制)
-@version 3.3 (集成最新智能死区与独立双PID算法，彻底解决停机抖动与收敛慢问题)
+@version 3.4 (移除PID串口调试输出，彻底消除loop阻塞风险)
 */
 #include <Arduino.h>
 #include <micro_ros_platformio.h>
@@ -25,18 +25,15 @@ const int M_PWM[2] = {21, 20};
 const int M_IN1[2] = {14, 16};
 const int M_IN2[2] = {15, 17};
 const int STBY = 41;
-
 #define ENC_RL_PULSE_PIN 4
 #define ENC_RL_DIR_PIN 5
 #define ENC_RR_PULSE_PIN 13
 #define ENC_RR_DIR_PIN 12
 #define ENC_Z_PIN 2
-
 #define I2C_SDA 45
 #define I2C_SCL 46
 #define LIDAR_RX 9
 #define LIDAR_MCTR 10
-
 const int PWM_FREQ = 10000;
 const int PWM_RES = 8;
 const int LIDAR_PWM_CH = 4;
@@ -47,11 +44,9 @@ const int LIDAR_PWM_CH = 4;
 #define TRACKWIDTH 0.116f
 #define ENC_PULSES_PER_REV 2048
 #define MOTOR_ENCODER_RATIO 2.0f
-
 // 编码器方向系数 (配合调试好的 ISR 使用)
 #define ENC_RL_DIR -1.0f
 #define ENC_RR_DIR 1.0f
-
 #define MAX_LINEAR_VEL 2.45f
 #define MAX_STEERING_ANGLE 30.0f
 #define MAX_ANGULAR_VEL 60.0f
@@ -68,17 +63,14 @@ const int LIDAR_PWM_CH = 4;
 // 默认值设为平滑保守值，可根据实际测试通过代码或串口动态调整
 float Kp_L = 156.0, Ki_L = 15.0, Kd_L = 0.0;
 float Kp_R = 156.0, Ki_R = 15.0, Kd_R = 0.0;
-
 #define MAX_INTEGRAL_PWM 80.0 // 稍微放宽积分限幅，防止过早饱和
 #define MIN_START_PWM 35      // 🚨 核心修改：从 46 降至 35，减少横跳概率
 
 // ==================== 全局对象与变量 ====================
 Servo steeringServo;
-
 char WIFI_SSID[] = "wyyyz";
 char WIFI_PASS[] = "12345678";
-char AGENT_IP[] = "10.42.0.1";
-
+char AGENT_IP[] = "192.168.137.99";
 rcl_subscription_t subscriber;
 geometry_msgs__msg__Twist twist_msg;
 rcl_publisher_t imu_publisher;
@@ -89,9 +81,8 @@ rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
-
 HardwareSerial LidarSerial(1);
-const IPAddress PC_IP(10, 42, 0, 1);
+const IPAddress PC_IP(192, 168, 137, 99);
 const uint16_t UDP_PORT = 9999;
 #define MAX_PACKET_SIZE 128
 uint8_t frameBuf[MAX_PACKET_SIZE];
@@ -150,7 +141,6 @@ bool readMPU6500(float *ax, float *ay, float *az, float *gx, float *gy, float *g
   Wire1.requestFrom(MPU_ADDR, (uint8_t)14);
   if (Wire1.available() < 14)
     return false;
-
   int16_t raw_ax = (Wire1.read() << 8) | Wire1.read();
   int16_t raw_ay = (Wire1.read() << 8) | Wire1.read();
   int16_t raw_az = (Wire1.read() << 8) | Wire1.read();
@@ -159,7 +149,6 @@ bool readMPU6500(float *ax, float *ay, float *az, float *gx, float *gy, float *g
   int16_t raw_gx = (Wire1.read() << 8) | Wire1.read();
   int16_t raw_gy = (Wire1.read() << 8) | Wire1.read();
   int16_t raw_gz = (Wire1.read() << 8) | Wire1.read();
-
   *ax = (float)raw_ax / 8192.0 * 9.80665;
   *ay = (float)raw_ay / 8192.0 * 9.80665;
   *az = (float)raw_az / 8192.0 * 9.80665;
@@ -194,7 +183,6 @@ void setMotorDirectionAndSpeed(int index, int speed_pwm)
     ledcWrite(index, 0);
     return;
   }
-
   if (speed_pwm > 0)
   {
     digitalWrite(M_IN1[index], HIGH);
@@ -213,7 +201,6 @@ void driveAckermann(float vx, float omega)
 {
   last_cmd_vx = vx;
   last_cmd_omega = omega;
-
   vx = constrain(vx, -MAX_LINEAR_VEL, MAX_LINEAR_VEL);
   omega = constrain(omega, -MAX_ANGULAR_VEL * M_PI / 180.0f, MAX_ANGULAR_VEL * M_PI / 180.0f);
 
@@ -247,7 +234,7 @@ void driveAckermann(float vx, float omega)
   target_v_left = left_wheel_speed;
   target_v_right = right_wheel_speed;
 
-  // 🚨 核心修复：停止时不仅清零积分，还清零误差历史，防止积分冻结导致停机抖动
+  // 🚨 核心修复：停止时不仅清零积分，还请零误差历史，防止积分冻结导致停机抖动
   if (fabs(vx) < 0.01f && fabs(omega) < 0.01f)
   {
     integral[0] = 0.0f;
@@ -271,7 +258,6 @@ void updateControlAndOdometry()
   {
     float dt = (now - last_pid_time) / 1000.0f;
     last_pid_time = now;
-
     if (!odom_initialized)
     {
       last_enc_count[0] = enc_rl_count;
@@ -289,13 +275,6 @@ void updateControlAndOdometry()
     float errors[2] = {0.0, 0.0};
     float derivatives[2] = {0.0, 0.0};
     int speed_pwms[2] = {0, 0};
-
-    // 【调试用】降频打印计数器：每 25 次 (500ms) 打印一次
-    static int debug_cnt = 0;
-    debug_cnt++;
-    bool print_debug = (debug_cnt >= 25);
-    if (print_debug)
-      debug_cnt = 0;
 
     for (int i = 0; i < 2; i++)
     {
@@ -350,18 +329,6 @@ void updateControlAndOdometry()
       setMotorDirectionAndSpeed(i, speed_pwm);
     }
 
-    // 【调试输出】打印核心 PID 变量，帮助排查抖动
-    if (print_debug)
-    {
-      Serial.printf("\n[ROS_CMD] vx: %.2f, omega: %.2f | Target -> L: %.2f, R: %.2f\n",
-                    last_cmd_vx, last_cmd_omega, target_v_left, target_v_right);
-      Serial.printf("[PID_DBG] L: act=%.2f, err=%.2f, int=%.2f, der=%.2f, pwm=%4d\n",
-                    actual_v[0], errors[0], integral[0], derivatives[0], speed_pwms[0]);
-      Serial.printf("[PID_DBG] R: act=%.2f, err=%.2f, int=%.2f, der=%.2f, pwm=%4d\n",
-                    actual_v[1], errors[1], integral[1], derivatives[1], speed_pwms[1]);
-      Serial.println("--------------------------------------------------");
-    }
-
     // 4. 里程计更新 (复用刚刚计算出的 actual_v，保证数据严格同步)
     float v_left = actual_v[0];
     float v_right = actual_v[1];
@@ -413,7 +380,6 @@ void publishImu()
   float ax, ay, az, gx, gy, gz;
   if (!readMPU6500(&ax, &ay, &az, &gx, &gy, &gz))
     return;
-
   float a_x = ay;
   float a_y = az;
   float a_z = ax;
@@ -426,7 +392,6 @@ void publishImu()
   imu_msg.header.stamp.sec = tv.tv_sec;
   imu_msg.header.stamp.nanosec = tv.tv_usec * 1000;
   rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
-
   imu_msg.linear_acceleration.x = a_x;
   imu_msg.linear_acceleration.y = a_y;
   imu_msg.linear_acceleration.z = a_z;
@@ -434,7 +399,6 @@ void publishImu()
   imu_msg.angular_velocity.y = g_y;
   imu_msg.angular_velocity.z = g_z;
   imu_msg.orientation_covariance[0] = -1.0;
-
   (void)rcl_publish(&imu_publisher, &imu_msg, NULL);
 }
 
@@ -570,11 +534,9 @@ void setup()
   pinMode(ENC_RL_PULSE_PIN, INPUT_PULLUP);
   pinMode(ENC_RL_DIR_PIN, INPUT_PULLUP);
   attachInterrupt(ENC_RL_PULSE_PIN, encRL_ISR, RISING);
-
   pinMode(ENC_RR_PULSE_PIN, INPUT_PULLUP);
   pinMode(ENC_RR_DIR_PIN, INPUT_PULLUP);
   attachInterrupt(ENC_RR_PULSE_PIN, encRR_ISR, RISING);
-
   if (ENC_Z_PIN >= 0)
     pinMode(ENC_Z_PIN, INPUT_PULLUP);
   Serial.println("✅ 编码器初始化完成");
@@ -583,19 +545,16 @@ void setup()
   agent_ip.fromString(AGENT_IP);
   set_microros_wifi_transports(WIFI_SSID, WIFI_PASS, agent_ip, 8888);
   allocator = rcl_get_default_allocator();
-
   int retry_count = 0;
   while (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK && retry_count < 10)
   {
     delay(1000);
     retry_count++;
   }
-
   rclc_node_init_default(&node, "esp32_ackermann_slam", "", &support);
   rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "/cmd_vel");
   rclc_publisher_init_default(&imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "/imu/data");
   rclc_publisher_init_default(&odom_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "/odom");
-
   rclc_executor_init(&executor, &support.context, 1, &allocator);
   rclc_executor_add_subscription(&executor, &subscriber, &twist_msg, &subscription_callback, ON_NEW_DATA);
 
@@ -620,7 +579,6 @@ void loop()
     delay(1000);
     return;
   }
-
   rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
 
   static unsigned long last_imu_time = 0;
