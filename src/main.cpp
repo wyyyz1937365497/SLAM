@@ -70,7 +70,7 @@ float Kp_R = 156.0, Ki_R = 15.0, Kd_R = 0.0;
 Servo steeringServo;
 char WIFI_SSID[] = "wyyyz";
 char WIFI_PASS[] = "12345678";
-char AGENT_IP[] = "192.168.137.99";
+char AGENT_IP[] = "192.168.12.1";
 rcl_subscription_t subscriber;
 geometry_msgs__msg__Twist twist_msg;
 rcl_publisher_t imu_publisher;
@@ -82,7 +82,7 @@ rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 HardwareSerial LidarSerial(1);
-const IPAddress PC_IP(192, 168, 137, 99);
+const IPAddress PC_IP(192, 168, 12, 1);
 const uint16_t UDP_PORT = 9999;
 #define MAX_PACKET_SIZE 128
 uint8_t frameBuf[MAX_PACKET_SIZE];
