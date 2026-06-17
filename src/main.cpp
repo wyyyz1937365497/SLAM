@@ -68,9 +68,9 @@ float Kp_R = 156.0, Ki_R = 15.0, Kd_R = 0.0;
 
 // ==================== 全局对象与变量 ====================
 Servo steeringServo;
-char WIFI_SSID[] = "wyyyz";
-char WIFI_PASS[] = "12345678";
-char AGENT_IP[] = "192.168.12.1";
+char WIFI_SSID[] = "buyaotaoshui";
+char WIFI_PASS[] = "buyaotaoshui";
+char AGENT_IP[] = "192.168.123.86";
 rcl_subscription_t subscriber;
 geometry_msgs__msg__Twist twist_msg;
 rcl_publisher_t imu_publisher;
@@ -82,7 +82,7 @@ rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 HardwareSerial LidarSerial(1);
-const IPAddress PC_IP(192, 168, 12, 1);
+const IPAddress PC_IP(192, 168, 123, 86);
 const uint16_t UDP_PORT = 9999;
 #define MAX_PACKET_SIZE 128
 uint8_t frameBuf[MAX_PACKET_SIZE];
@@ -380,9 +380,11 @@ void publishImu()
   float ax, ay, az, gx, gy, gz;
   if (!readMPU6500(&ax, &ay, &az, &gx, &gy, &gz))
     return;
+  // 坐标转换: MPU(Y前, X右, Z上) -> ROS(X前, Y左, Z上)
   float a_x = ay;
   float a_y = az;
   float a_z = ax;
+
   float g_x = gy;
   float g_y = gz;
   float g_z = gx;
