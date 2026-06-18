@@ -19,6 +19,7 @@
 #include <sys/time.h>
 #include <driver/gpio.h>
 #include <ESP32Servo.h>
+#include <std_msgs/msg/float32.h>
 
 // ==================== 硬件引脚配置 ====================
 const int M_PWM[2] = {21, 20};
@@ -68,9 +69,12 @@ float Kp_R = 156.0, Ki_R = 15.0, Kd_R = 0.0;
 
 // ==================== 全局对象与变量 ====================
 Servo steeringServo;
-char WIFI_SSID[] = "buyaotaoshui";
-char WIFI_PASS[] = "buyaotaoshui";
-char AGENT_IP[] = "192.168.123.86";
+// char WIFI_SSID[] = "buyaotaoshui";
+// char WIFI_PASS[] = "buyaotaoshui";
+// char AGENT_IP[] = "192.168.123.86";
+char WIFI_SSID[] = "wyyyz";
+char WIFI_PASS[] = "12345678";
+char AGENT_IP[] = "192.168.137.99";
 rcl_subscription_t subscriber;
 geometry_msgs__msg__Twist twist_msg;
 rcl_publisher_t imu_publisher;
@@ -82,7 +86,7 @@ rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 HardwareSerial LidarSerial(1);
-const IPAddress PC_IP(192, 168, 123, 86);
+const IPAddress PC_IP(192, 168, 137, 99);
 const uint16_t UDP_PORT = 9999;
 #define MAX_PACKET_SIZE 128
 uint8_t frameBuf[MAX_PACKET_SIZE];
@@ -111,6 +115,11 @@ unsigned long last_pid_time = 0;
 // 【调试用】记录最近的 ROS 指令
 float last_cmd_vx = 0.0;
 float last_cmd_omega = 0.0;
+// ==================== 里程计调试缩放系数 ====================
+// 仅用于修正发布到ROS的Odom方向，不影响底层PID控制
+float odom_scale = 1.0f; // 默认1.0。如果前进时rviz后退，改为 -1.0
+rcl_subscription_t scale_subscriber;
+std_msgs__msg__Float32 scale_msg;
 
 // ==================== 纯 Wire1 手写 MPU6500 驱动 ====================
 #define MPU_ADDR 0x68
@@ -249,6 +258,17 @@ void subscription_callback(const void *msgin)
   const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
   driveAckermann(msg->linear.x, msg->angular.z);
 }
+//=======================odom调整回调==================
+void scale_callback(const void *msgin)
+{
+  const std_msgs__msg__Float32 *msg = (const std_msgs__msg__Float32 *)msgin;
+  if (msg->data != 0.0f)
+  {
+    odom_scale = msg->data;
+    Serial.print("✅ 收到ROS指令，odom_scale 更新为: ");
+    Serial.println(odom_scale);
+  }
+}
 
 // ==================== 统一的 PID 控制与里程计更新 (20ms) ====================
 void updateControlAndOdometry()
@@ -330,8 +350,10 @@ void updateControlAndOdometry()
     }
 
     // 4. 里程计更新 (复用刚刚计算出的 actual_v，保证数据严格同步)
-    float v_left = actual_v[0];
-    float v_right = actual_v[1];
+    // 4. 里程计更新 (复用刚刚计算出的 actual_v，保证数据严格同步)
+    // 🚨 乘以 odom_scale 修正发布的里程计方向，不影响 PID 闭环
+    float v_left = actual_v[0] * odom_scale;
+    float v_right = actual_v[1] * odom_scale;
 
     float v_body = (v_left + v_right) / 2.0f;
     float w_encoder = (v_right - v_left) / TRACKWIDTH;
@@ -380,7 +402,6 @@ void publishImu()
   float ax, ay, az, gx, gy, gz;
   if (!readMPU6500(&ax, &ay, &az, &gx, &gy, &gz))
     return;
-  // 坐标转换: MPU(Y前, X右, Z上) -> ROS(X前, Y左, Z上)
   float a_x = ay;
   float a_y = az;
   float a_z = ax;
@@ -555,10 +576,12 @@ void setup()
   }
   rclc_node_init_default(&node, "esp32_ackermann_slam", "", &support);
   rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "/cmd_vel");
+  rclc_subscription_init_default(&scale_subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "/odom_scale");
   rclc_publisher_init_default(&imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "/imu/data");
   rclc_publisher_init_default(&odom_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "/odom");
-  rclc_executor_init(&executor, &support.context, 1, &allocator);
+  rclc_executor_init(&executor, &support.context, 2, &allocator);
   rclc_executor_add_subscription(&executor, &subscriber, &twist_msg, &subscription_callback, ON_NEW_DATA);
+  rclc_executor_add_subscription(&executor, &scale_subscriber, &scale_msg, &scale_callback, ON_NEW_DATA);
 
   LidarSerial.begin(115200, SERIAL_8N1, LIDAR_RX, -1);
   pinMode(LIDAR_MCTR, OUTPUT);
